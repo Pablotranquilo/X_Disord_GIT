@@ -1,8 +1,0 @@
-discord.py
-python-dotenv
-easyocr
-torch
-torchvision
-torchaudio
-opencv-python-headless
-Pillow
