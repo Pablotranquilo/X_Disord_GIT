@@ -620,6 +620,8 @@ async def handle_result(result: VerificationResult):
 # -----------------------------
 # Discord events
 # -----------------------------
+tree = discord.app_commands.CommandTree(client)
+
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
@@ -628,6 +630,131 @@ async def on_ready():
 
     # Start OCR worker
     client.loop.create_task(worker())
+
+    try:
+        await tree.sync()
+        print("Slash commands synced.")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
+
+
+@tree.command(name="verify", description="Upload a screenshot for verification")
+@discord.app_commands.describe(image="Image screenshot to verify")
+async def verify(interaction: discord.Interaction, image: discord.Attachment):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not (image.content_type and image.content_type.startswith("image/")):
+        await interaction.response.send_message("Please upload a valid image file.", ephemeral=True)
+        return
+
+    x_link = await link_get(str(interaction.user.id))
+    if not x_link:
+        link = await create_signed_start_link(str(interaction.user.id))
+
+        embed = discord.Embed(
+            title="❌ X Account Required",
+            description="You must link your X account before using `/verify`.",
+            color=0xFF0000
+        )
+        embed.set_footer(text="⏱️ Link expires in 10 minutes")
+
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(
+            label="Connect X Account",
+            style=discord.ButtonStyle.link,
+            url=link,
+            emoji="🔵"
+        ))
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        image_bytes = await image.read()
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, reader.readtext, image_bytes)
+
+        project = classify_project(results)
+
+        score_val = None
+        if project == "Wallchain":
+            score_val = extract_wallchain_score(results)
+        elif project == "Kaito":
+            score_val = extract_kaito_score(results)
+        elif project == "Xeet":
+            score_val = extract_xeet_score(results)
+        elif project == "Cookie":
+            score_val = extract_cookie_score(results)
+        elif project == "Mindoshare":
+            score_val = extract_mindoshare_score(results)
+        else:
+            score_val = extract_mindoshare_score(results) or extract_wallchain_score(results) or extract_kaito_score(results)
+
+        handle_error = None
+        img_handle = extract_handle(results)
+        required_handle = x_link.get("x_username", "").lower()
+        if img_handle and img_handle.lower() != required_handle:
+            handle_error = f"Found @{img_handle} in image, but your linked account is @{required_handle}"
+
+        result = VerificationResult(type("Job", (), {
+            "message": type("Msg", (), {"guild": interaction.guild, "author": interaction.user, "channel": interaction.channel}),
+            "user_id": str(interaction.user.id),
+            "guild_id": str(interaction.guild.id)
+        })(), score_val, project, handle_match_error=handle_error)
+
+        role = discord.utils.get(interaction.guild.roles, name=result.role_name)
+        if not role and result.role_name:
+            try:
+                role = await interaction.guild.create_role(name=result.role_name)
+            except discord.Forbidden:
+                role = None
+
+        if role:
+            try:
+                await interaction.user.add_roles(role)
+            except discord.Forbidden:
+                pass
+
+        await database.log_result(
+            discord_id=str(interaction.user.id),
+            discord_username=str(interaction.user),
+            guild_id=str(interaction.guild.id),
+            project=project,
+            score=str(score_val) if score_val else None,
+            role_assigned=result.role_name
+        )
+
+        embed = discord.Embed(
+            description=(
+                f"❌ **Identity Mismatch**\n{result.handle_match_error}\nThis screenshot does not belong to your linked account."
+                if result.handle_match_error else
+                f"✅ **Verification Successful**\nFound **{project}** score!"
+                if score_val else
+                f"❌ **Verification Failed**\nCould not detect a **{project}** score.\nPlease ensure the image is clear and uncropped."
+            ),
+            color=0xED4245 if (result.handle_match_error or not score_val) else 0x57F287
+        )
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+
+        if score_val:
+            embed.add_field(name="🎯 Score", value=f"`{score_val}`", inline=True)
+        if result.role_name:
+            embed.add_field(name="🎭 Role", value=f"`{result.role_name}`", inline=True)
+
+        x_handle = f"[@{x_link.get('x_username')}](https://x.com/{x_link.get('x_username')})"
+        is_verified = x_link.get("verified") or x_link.get("verified_type") in ["blue", "business", "government"]
+        if is_verified:
+            x_handle += " ☑️"
+        embed.add_field(name="🔗 X Account", value=x_handle, inline=False)
+        embed.set_footer(text="Mindo AI Verifier", icon_url=client.user.display_avatar.url if client.user else None)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Verification failed: {e}", ephemeral=True)
+
 
 @client.event
 async def on_message(message):
@@ -640,24 +767,19 @@ async def on_message(message):
     if content.lower() == "!xlink":
         try:
             link = await create_signed_start_link(str(message.author.id))
-            
+
             embed = discord.Embed(
                 title="🔗 Link Your X Account",
                 description="Click the button below to securely connect your X (Twitter) account.\n\n"
-                            "After linking, you'll see a success page. Then return to Discord and post your image!",
-                color=0x1DA1F2  # Twitter blue
+                            "After linking, run `/verify` and upload your image.",
+                color=0x1DA1F2
             )
             embed.set_footer(text="⏱️ Link expires in 10 minutes")
-            
+
             view = discord.ui.View()
-            button = discord.ui.Button(
-                label="Connect X Account",
-                style=discord.ButtonStyle.link,
-                url=link,
-                emoji="🔵"
-            )
+            button = discord.ui.Button(label="Connect X Account", style=discord.ButtonStyle.link, url=link, emoji="🔵")
             view.add_item(button)
-            
+
             await message.reply(embed=embed, view=view)
         except Exception as e:
             await message.reply(f"❌ Could not create link: {e}")
@@ -679,50 +801,9 @@ async def on_message(message):
         await message.reply("✅ Unlinked." if removed else "You were not linked.")
         return
 
-    # ---- Gate OCR: must be linked ----
-    x_link = await link_get(str(message.author.id))
-    if not x_link:
-        # only gate if they tried to submit an image
-        image_attachments = [
-            att for att in message.attachments
-            if att.content_type and att.content_type.startswith("image/")
-        ]
-        if image_attachments:
-            link = await create_signed_start_link(str(message.author.id))
-            
-            embed = discord.Embed(
-                title="❌ X Account Required",
-                description="You must link your X account before using this bot.\n\n"
-                            "Click the button below to connect your account, then post your image again!",
-                color=0xFF0000  # Red
-            )
-            embed.set_footer(text="⏱️ Link expires in 10 minutes")
-            
-            view = discord.ui.View()
-            button = discord.ui.Button(
-                label="Connect X Account",
-                style=discord.ButtonStyle.link,
-                url=link,
-                emoji="🔵"
-            )
-            view.add_item(button)
-            
-            await message.reply(embed=embed, view=view)
-        return
+    if message.attachments:
+        await message.reply("Use `/verify` for image verification (ephemeral result).", delete_after=10)
 
-    # ---- Check Attachments ----
-    image_attachments = [
-        att for att in message.attachments
-        if att.content_type and att.content_type.startswith("image/")
-    ]
-    if not image_attachments:
-        return
-
-    # Enqueue job
-    await message.reply("Scanning your image for a number...")
-    image_bytes = await image_attachments[0].read()
-    job = VerificationJob(message, image_bytes)
-    await queue.put(job)
 
 # -----------------------------
 # Main
